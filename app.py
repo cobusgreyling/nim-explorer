@@ -178,14 +178,14 @@ def fetch_catalog(api_key):
 
     chat_ids = sorted(r[0] for r in rows if r[3])
 
-    # Build HTML table with JS click-to-select
+    # Build HTML table with JS click-to-select and client-side search
     table_rows = ""
     for mid, owner, category, is_chat in rows:
         cat_color = NVIDIA_GREEN if is_chat else "#888"
-        # JS: find the textbox with elem_id="selected-model", set value, fire input event
         escaped_mid = mid.replace("'", "\\'")
         table_rows += (
-            f'<tr style="border-bottom:1px solid #333;cursor:pointer" '
+            f'<tr class="catalog-row" data-model="{mid.lower()}" '
+            f'style="border-bottom:1px solid #333;cursor:pointer" '
             f"onclick=\""
             f"var tb=document.querySelector('#selected-model textarea,#selected-model input');"
             f"if(tb){{var ns=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype||window.HTMLTextAreaElement.prototype,'value').set;"
@@ -197,7 +197,27 @@ def fetch_catalog(api_key):
             f'<td style="padding:8px;color:#ccc">{owner}</td>'
             f'<td style="padding:8px;color:{cat_color};font-weight:bold;font-size:12px">{category}</td></tr>'
         )
+
+    search_js = """
+    <script>
+    (function() {
+        var input = document.getElementById('catalog-search');
+        if (!input) return;
+        input.addEventListener('input', function() {
+            var q = this.value.toLowerCase();
+            document.querySelectorAll('.catalog-row').forEach(function(row) {
+                row.style.display = row.getAttribute('data-model').includes(q) ? '' : 'none';
+            });
+        });
+    })();
+    </script>
+    """
+
     html = f"""
+    <input id="catalog-search" type="text" placeholder="Filter models..."
+        style="width:100%;padding:10px 12px;margin-bottom:8px;border-radius:6px;
+        border:1px solid #444;background:{BG_CARD};color:white;font-size:14px;
+        outline:none;box-sizing:border-box" />
     <div style="max-height:500px;overflow-y:auto;border-radius:8px">
     <table style="width:100%;border-collapse:collapse;font-size:14px">
         <thead><tr style="border-bottom:2px solid {NVIDIA_GREEN};color:#aaa">
@@ -208,6 +228,7 @@ def fetch_catalog(api_key):
         <tbody>{table_rows}</tbody>
     </table></div>
     <p style="color:#888;font-size:12px;margin-top:8px">{len(rows)} models total, {len(chat_ids)} chat models. Click a row to select it.</p>
+    {search_js}
     """
     return html, chat_ids
 
@@ -228,8 +249,6 @@ def _extract_msg(h):
     else:
         content = h
 
-    # Force content to a plain string — Gradio 6 ChatMessage.content
-    # can be a list of content parts or other non-string types
     if isinstance(content, list):
         parts = []
         for part in content:
@@ -249,7 +268,7 @@ def _extract_msg(h):
 
 
 def chat_stream(message, history, api_key, model, system_prompt, temperature, max_tokens, top_p):
-    """Stream a chat completion from the selected NIM model."""
+    """Stream a chat completion from the selected NIM model. Returns (partial, ttft, total_time, tokens, req_json, resp_json)."""
     if not model:
         raise gr.Error("Select a model first.")
     client = _get_client(api_key)
@@ -278,6 +297,7 @@ def chat_stream(message, history, api_key, model, system_prompt, temperature, ma
     )
 
     try:
+        t_start = time.time()
         stream = client.chat.completions.create(**request_body)
     except Exception as exc:
         err = str(exc)
@@ -289,16 +309,26 @@ def chat_stream(message, history, api_key, model, system_prompt, temperature, ma
         raise gr.Error(f"Chat request failed: {exc}")
 
     partial = ""
-    full_response_chunks = []
+    token_count = 0
+    ttft = None
     for chunk in stream:
         delta = chunk.choices[0].delta
         if delta.content:
+            if ttft is None:
+                ttft = time.time() - t_start
             partial += delta.content
-            full_response_chunks.append(delta.content)
-            yield partial, req_json, _build_inspector_response(200, {"streaming": True, "partial_length": len(partial)})
+            token_count += 1
+            elapsed = time.time() - t_start
+            yield partial, ttft, elapsed, token_count, req_json, _build_inspector_response(
+                200, {"streaming": True, "partial_length": len(partial)}
+            )
 
-    yield partial, req_json, _build_inspector_response(
-        200, {"content": partial, "model": model, "usage": "see streaming chunks"}
+    total_time = time.time() - t_start
+    if ttft is None:
+        ttft = total_time
+    yield partial, ttft, total_time, token_count, req_json, _build_inspector_response(
+        200, {"content": partial, "model": model, "tokens": token_count,
+               "time_to_first_token": f"{ttft:.2f}s", "total_time": f"{total_time:.2f}s"}
     )
 
 
@@ -392,7 +422,7 @@ def build_app():
             # Tab 2 — Model Catalog
             # ===========================================================
             with gr.Tab("Model Catalog"):
-                gr.Markdown("Browse available NIM models. Copy a model ID and paste it below to use in Playground.")
+                gr.Markdown("Browse available NIM models. Click a row to select it, then use in Playground.")
                 refresh_btn = gr.Button("Refresh Catalog", variant="primary")
                 catalog_html = gr.HTML()
                 selected_model_display = gr.Textbox(
@@ -436,13 +466,20 @@ def build_app():
                         top_p = gr.Slider(
                             minimum=0, maximum=1, value=0.9, step=0.05, label="Top P"
                         )
+                        # Token counter display
+                        chat_stats = gr.Markdown(
+                            value="*No requests yet*",
+                            elem_id="chat-stats",
+                        )
                     with gr.Column(scale=2):
                         chatbot = gr.Chatbot(label="Chat", height=480)
                         msg_input = gr.Textbox(
-                            label="Message", placeholder="Type your message...", lines=2
+                            label="Message",
+                            placeholder="Type your message... (Shift+Enter for newline)",
+                            lines=2,
                         )
                         with gr.Row():
-                            send_btn = gr.Button("Send", variant="primary")
+                            send_btn = gr.Button("Send", variant="primary", elem_id="send-btn")
                             clear_btn = gr.Button("Clear", variant="secondary")
 
                 # Wire "Use in Playground" from catalog tab
@@ -462,35 +499,68 @@ def build_app():
                     outputs=[playground_model],
                 )
 
+                # Auto-clear chat when model changes
+                def on_model_change():
+                    return [], "*No requests yet*"
+
+                playground_model.change(
+                    fn=on_model_change,
+                    outputs=[chatbot, chat_stats],
+                )
+
                 def handle_chat(message, history, api_key, model, sys_prompt, temp, max_tok, tp):
                     if not message.strip():
-                        yield history, "", "", ""
+                        yield history, "", gr.update(interactive=True), "", "", ""
                         return
 
-                    # Add user message to history
+                    # Add user message, disable send button
                     history = list(history) + [gr.ChatMessage(role="user", content=message)]
-                    yield history, "", "", ""
+                    yield history, "", gr.update(interactive=False), "", "", ""
 
-                    # Stream assistant response
-                    for partial, req_json, resp_json in chat_stream(
-                        message, history[:-1], api_key, model, sys_prompt, temp, max_tok, tp
-                    ):
-                        updated = list(history) + [gr.ChatMessage(role="assistant", content=partial)]
-                        yield updated, "", req_json, resp_json
+                    # Stream assistant response, catch errors gracefully
+                    stats_md = ""
+                    updated = history
+                    req_json = ""
+                    resp_json = ""
+                    try:
+                        for partial, ttft, elapsed, tokens, req_json, resp_json in chat_stream(
+                            message, history[:-1], api_key, model, sys_prompt, temp, max_tok, tp
+                        ):
+                            updated = list(history) + [gr.ChatMessage(role="assistant", content=partial)]
+                            stats_md = (
+                                f"**TTFT** {ttft:.2f}s &nbsp; "
+                                f"**Elapsed** {elapsed:.2f}s &nbsp; "
+                                f"**Tokens** ~{tokens}"
+                            )
+                            yield updated, stats_md, gr.update(interactive=False), req_json, resp_json, ""
+                    except gr.Error as e:
+                        error_msg = str(e)
+                        updated = list(history) + [
+                            gr.ChatMessage(role="assistant", content=f"**Error:** {error_msg}")
+                        ]
+                        stats_md = f"**Error** — {error_msg}"
+                        yield updated, stats_md, gr.update(interactive=True), req_json, resp_json, ""
+                        return
+
+                    # Re-enable send button
+                    yield updated, stats_md, gr.update(interactive=True), req_json, resp_json, ""
 
                 send_btn.click(
                     fn=handle_chat,
                     inputs=[msg_input, chatbot, api_key_state, playground_model, system_prompt, temperature, max_tokens, top_p],
-                    outputs=[chatbot, msg_input, last_req_state, last_resp_state],
+                    outputs=[chatbot, chat_stats, send_btn, last_req_state, last_resp_state, msg_input],
                 )
 
                 msg_input.submit(
                     fn=handle_chat,
                     inputs=[msg_input, chatbot, api_key_state, playground_model, system_prompt, temperature, max_tokens, top_p],
-                    outputs=[chatbot, msg_input, last_req_state, last_resp_state],
+                    outputs=[chatbot, chat_stats, send_btn, last_req_state, last_resp_state, msg_input],
                 )
 
-                clear_btn.click(fn=lambda: [], outputs=[chatbot])
+                clear_btn.click(
+                    fn=lambda: ([], "*No requests yet*"),
+                    outputs=[chatbot, chat_stats],
+                )
 
             # ===========================================================
             # Tab 4 — Compare
