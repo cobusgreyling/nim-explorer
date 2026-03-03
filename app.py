@@ -811,26 +811,54 @@ def run_benchmark(api_key, selected_models, usage_log):
         category = prompt_data["category"]
         prompt = prompt_data["prompt"]
         start = time.time()
-        ttft = None
-        token_count = 0
         text = ""
-        try:
-            stream = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=512,
-                temperature=0.7,
-                stream=True,
-            )
-            for chunk in stream:
-                delta = chunk.choices[0].delta
-                if delta.content:
-                    if ttft is None:
-                        ttft = time.time() - start
-                    text += delta.content
-                    token_count += 1
-        except Exception as exc:
-            text = f"Error: {exc}"
+        token_count = 0
+        ttft = None
+        # Try streaming first for TTFT measurement, fall back to non-streaming
+        for attempt in range(2):
+            try:
+                if attempt == 0:
+                    stream = client.chat.completions.create(
+                        model=model,
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=512,
+                        temperature=0.7,
+                        stream=True,
+                    )
+                    text = ""
+                    token_count = 0
+                    ttft = None
+                    for chunk in stream:
+                        delta = chunk.choices[0].delta
+                        if delta.content:
+                            if ttft is None:
+                                ttft = time.time() - start
+                            text += delta.content
+                            token_count += 1
+                else:
+                    # Non-streaming fallback
+                    start = time.time()
+                    resp = client.chat.completions.create(
+                        model=model,
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=512,
+                        temperature=0.7,
+                        stream=False,
+                    )
+                    text = resp.choices[0].message.content or ""
+                    token_count = getattr(resp.usage, "completion_tokens", 0) if resp.usage else len(text.split())
+                    ttft = None
+                break  # success
+            except Exception as exc:
+                err = str(exc)
+                if "404" in err or "Not Found" in err:
+                    text = f"Model not available for this account."
+                    break
+                if attempt == 0 and ("peer closed" in err or "incomplete" in err.lower()):
+                    time.sleep(0.5)
+                    continue
+                text = f"Error: {exc}"
+                break
         total_time = time.time() - start
         if ttft is None:
             ttft = total_time
@@ -846,7 +874,7 @@ def run_benchmark(api_key, selected_models, usage_log):
     completed = []
     total_tasks = len(selected_models) * len(BENCHMARK_PROMPTS)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         futures = {}
         for model in selected_models:
             for prompt_data in BENCHMARK_PROMPTS:
